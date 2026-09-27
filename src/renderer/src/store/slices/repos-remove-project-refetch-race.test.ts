@@ -245,8 +245,12 @@ describe('fetchRepos still purges what removeProject will not purge itself', () 
     await store.getState().removeProject(removedRepo.id)
     consoleError.mockRestore()
 
-    // Proves the failed removal left the repo and its terminal state in place.
+    // Proves the failed removal left the repo and its terminal state in place and killed nothing.
+    expect(ptyKill).not.toHaveBeenCalled()
+    expect(store.getState().tabsByWorktree).toHaveProperty(LISTED_WORKTREE_ID)
+    expect(store.getState().tabsByWorktree).toHaveProperty(DETECTED_ONLY_WORKTREE_ID)
     expect(store.getState().ptyIdsByTabId).toHaveProperty('tab-listed')
+    expect(store.getState().ptyIdsByTabId).toHaveProperty('tab-detected')
     reposList.mockImplementation(async () => [structuredClone(keptRepo)])
 
     await store.getState().fetchRepos()
@@ -281,5 +285,34 @@ describe('fetchRepos still purges what removeProject will not purge itself', () 
     expect(s.tabsByWorktree).not.toHaveProperty(DETECTED_ONLY_WORKTREE_ID)
     expect(s.ptyIdsByTabId).not.toHaveProperty('tab-listed')
     expect(s.ptyIdsByTabId).not.toHaveProperty('tab-detected')
+  })
+
+  it('kills each local PTY once when repos.remove fails after a refetch dropped the repo', async () => {
+    const store = seededStore()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    reposList.mockImplementation(async () => [structuredClone(keptRepo)])
+    let reposDuringRemove: string[] = []
+    reposRemove.mockImplementation(async () => {
+      store.setState((s) => ({
+        ptyIdsByTabId: {
+          ...s.ptyIdsByTabId,
+          'tab-listed': ['pty-listed', 'pty-late', 'remote:pty-remote']
+        }
+      }))
+      await store.getState().fetchRepos()
+      reposDuringRemove = store.getState().repos.map((repo) => repo.id)
+      throw new Error('remove timed out')
+    })
+
+    await store.getState().removeProject(removedRepo.id)
+    consoleError.mockRestore()
+
+    // Proves the refetch ran after the attach and dropped the repo before the remove failed.
+    expect(reposDuringRemove).toEqual([keptRepo.id])
+    expect(killCount('pty-listed')).toBe(1)
+    expect(killCount('pty-detected')).toBe(1)
+    expect(killCount('pty-late')).toBe(1)
+    expect(killCount('remote:pty-remote')).toBe(0)
+    expect(ptyKill).toHaveBeenCalledTimes(3)
   })
 })

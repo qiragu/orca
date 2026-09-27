@@ -37,7 +37,7 @@ import {
   projectCompatibilityFromRepos
 } from '../projects/project-compatibility-core'
 import { getRuntimeTargetHostId } from '../runtime-target-host'
-import { withoutWorktreesBeingRemoved } from './repo-removal'
+import { withoutWorktreesBeingRemoved } from './repo-removal-terminals'
 import { mergeFetchedProjectCompatibilityForHost } from '../projects/project-compatibility-host-merge'
 import { scheduleSafeAutoForkSync } from './safe-auto-fork-sync'
 
