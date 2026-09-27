@@ -127,23 +127,159 @@ describe('removeProject kills each PTY of the removed repo exactly once', () => 
     expect(ptyKill).toHaveBeenCalledTimes(2)
   })
 
-  it('kills a pre-existing PTY only once when the mid-removal refetch purged it', async () => {
+  it('kills a pre-existing PTY only once when a refetch runs mid-removal', async () => {
     const store = seededStore()
     reposList.mockImplementation(async () => [structuredClone(keptRepo)])
+    let reposDuringRemove: string[] = []
     let ptyTabsAfterRefetch: string[] = []
     reposRemove.mockImplementation(async () => {
       await store.getState().fetchRepos()
+      reposDuringRemove = store.getState().repos.map((repo) => repo.id)
       ptyTabsAfterRefetch = Object.keys(store.getState().ptyIdsByTabId)
     })
 
     await store.getState().removeProject(removedRepo.id)
 
-    // Proves the refetch already purged the PTY ids removeProject has to kill.
+    // Proves the refetch dropped the repo yet left its PTY ids to removeProject, so both of
+    // removeProject's reads see them and a second kill would show up here.
     expect(reposList).toHaveBeenCalledTimes(1)
-    expect(ptyTabsAfterRefetch).not.toContain('tab-listed')
-    expect(ptyTabsAfterRefetch).not.toContain('tab-detected')
+    expect(reposDuringRemove).toEqual([keptRepo.id])
+    expect(ptyTabsAfterRefetch).toContain('tab-listed')
+    expect(ptyTabsAfterRefetch).toContain('tab-detected')
     expect(killCount('pty-listed')).toBe(1)
     expect(killCount('pty-detected')).toBe(1)
     expect(ptyKill).toHaveBeenCalledTimes(2)
+  })
+
+  it('kills a PTY that attached during repos.remove before a refetch dropped the repo', async () => {
+    const store = seededStore()
+    reposList.mockImplementation(async () => [structuredClone(keptRepo)])
+    let reposDuringRemove: string[] = []
+    reposRemove.mockImplementation(async () => {
+      store.setState((s) => ({
+        ptyIdsByTabId: { ...s.ptyIdsByTabId, 'tab-listed': ['pty-listed', 'pty-late'] }
+      }))
+      await store.getState().fetchRepos()
+      reposDuringRemove = store.getState().repos.map((repo) => repo.id)
+    })
+
+    await store.getState().removeProject(removedRepo.id)
+
+    // Proves the refetch ran after the attach and inside repos.remove, and dropped the repo.
+    expect(reposList).toHaveBeenCalledTimes(1)
+    expect(reposDuringRemove).toEqual([keptRepo.id])
+    expect(killCount('pty-late')).toBe(1)
+    expect(killCount('pty-listed')).toBe(1)
+    expect(killCount('pty-detected')).toBe(1)
+    expect(ptyKill).toHaveBeenCalledTimes(3)
+    const s = store.getState()
+    expect(s.tabsByWorktree).not.toHaveProperty(LISTED_WORKTREE_ID)
+    expect(s.tabsByWorktree).not.toHaveProperty(DETECTED_ONLY_WORKTREE_ID)
+    expect(s.ptyIdsByTabId).not.toHaveProperty('tab-listed')
+    expect(s.ptyIdsByTabId).not.toHaveProperty('tab-detected')
+  })
+})
+
+describe('fetchRepos still purges what removeProject will not purge itself', () => {
+  it('drops workspace-space entries of the removed repo worktrees during the refetch', async () => {
+    const store = seededStore()
+    const keptWorktreeId = 'repo-kept::/kept/wt'
+    store.setState({
+      workspaceSpaceMeasurements: [
+        LISTED_WORKTREE_ID,
+        DETECTED_ONLY_WORKTREE_ID,
+        keptWorktreeId
+      ].map((worktreeId) => ({ worktreeId, status: 'ok' as const, sizeBytes: 1 }))
+    })
+    reposList.mockImplementation(async () => [structuredClone(keptRepo)])
+    let reposDuringRemove: string[] = []
+    reposRemove.mockImplementation(async () => {
+      await store.getState().fetchRepos()
+      reposDuringRemove = store.getState().repos.map((repo) => repo.id)
+    })
+
+    await store.getState().removeProject(removedRepo.id)
+
+    expect(reposDuringRemove).toEqual([keptRepo.id])
+    expect(
+      store.getState().workspaceSpaceMeasurements.map((measurement) => measurement.worktreeId)
+    ).toEqual([keptWorktreeId])
+  })
+
+  it('purges another repo that the mid-removal refetch drops', async () => {
+    const store = seededStore()
+    const otherRepo: Repo = { ...removedRepo, id: 'repo-other', path: '/other', addedAt: 3 }
+    const otherWorktreeId = 'repo-other::/other/wt'
+    store.setState((s) => ({
+      repos: [...s.repos, otherRepo],
+      worktreesByRepo: {
+        ...s.worktreesByRepo,
+        [otherRepo.id]: [
+          makeWorktree({ id: otherWorktreeId, repoId: otherRepo.id, path: '/other/wt' })
+        ]
+      },
+      tabsByWorktree: {
+        ...s.tabsByWorktree,
+        [otherWorktreeId]: [makeTab({ id: 'tab-other', worktreeId: otherWorktreeId })]
+      },
+      ptyIdsByTabId: { ...s.ptyIdsByTabId, 'tab-other': ['pty-other'] }
+    }))
+    reposList.mockImplementation(async () => [structuredClone(keptRepo)])
+    reposRemove.mockImplementation(async () => {
+      await store.getState().fetchRepos()
+    })
+
+    await store.getState().removeProject(removedRepo.id)
+
+    const s = store.getState()
+    expect(s.repos.map((repo) => repo.id)).toEqual([keptRepo.id])
+    expect(s.tabsByWorktree).not.toHaveProperty(otherWorktreeId)
+    expect(s.ptyIdsByTabId).not.toHaveProperty('tab-other')
+  })
+
+  it('purges the repo on a later refetch after removeProject failed', async () => {
+    const store = seededStore()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    reposRemove.mockRejectedValue(new Error('remove failed'))
+
+    await store.getState().removeProject(removedRepo.id)
+    consoleError.mockRestore()
+
+    // Proves the failed removal left the repo and its terminal state in place.
+    expect(store.getState().ptyIdsByTabId).toHaveProperty('tab-listed')
+    reposList.mockImplementation(async () => [structuredClone(keptRepo)])
+
+    await store.getState().fetchRepos()
+
+    const s = store.getState()
+    expect(s.tabsByWorktree).not.toHaveProperty(LISTED_WORKTREE_ID)
+    expect(s.tabsByWorktree).not.toHaveProperty(DETECTED_ONLY_WORKTREE_ID)
+    expect(s.ptyIdsByTabId).not.toHaveProperty('tab-listed')
+    expect(s.ptyIdsByTabId).not.toHaveProperty('tab-detected')
+  })
+
+  it('purges the repo terminal state when repos.remove fails after a refetch dropped it', async () => {
+    const store = seededStore()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    reposList.mockImplementation(async () => [structuredClone(keptRepo)])
+    let reposDuringRemove: string[] = []
+    reposRemove.mockImplementation(async () => {
+      await store.getState().fetchRepos()
+      reposDuringRemove = store.getState().repos.map((repo) => repo.id)
+      throw new Error('remove timed out')
+    })
+
+    await store.getState().removeProject(removedRepo.id)
+    consoleError.mockRestore()
+
+    // Proves the refetch dropped the repo rows, so no later refetch would purge its worktrees.
+    expect(reposDuringRemove).toEqual([keptRepo.id])
+    const s = store.getState()
+    expect(s.worktreesByRepo).not.toHaveProperty(removedRepo.id)
+    expect(s.detectedWorktreesByRepo).not.toHaveProperty(removedRepo.id)
+    expect(s.tabsByWorktree).not.toHaveProperty(LISTED_WORKTREE_ID)
+    expect(s.tabsByWorktree).not.toHaveProperty(DETECTED_ONLY_WORKTREE_ID)
+    expect(s.ptyIdsByTabId).not.toHaveProperty('tab-listed')
+    expect(s.ptyIdsByTabId).not.toHaveProperty('tab-detected')
   })
 })

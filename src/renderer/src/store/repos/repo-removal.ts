@@ -46,12 +46,24 @@ export function getKnownRepoWorktreeIds(
   return [...ids]
 }
 
+// Why: per store, the worktree ids each in-flight removeProject will purge itself (after killing their PTYs).
+const worktreeIdsBeingRemoved = new WeakMap<() => AppState, Set<ReadonlySet<string>>>()
+
+export function withoutWorktreesBeingRemoved(get: () => AppState, ids: string[]): string[] {
+  const removals = worktreeIdsBeingRemoved.get(get)
+  if (!removals || removals.size === 0) {
+    return ids
+  }
+  return ids.filter((id) => ![...removals].some((removal) => removal.has(id)))
+}
+
 export function createRepoRemovalActions(
   set: Parameters<StateCreator<AppState>>[0],
   get: Parameters<StateCreator<AppState>>[1]
 ): Pick<RepoSlice, 'removeProject'> {
   return {
     removeProject: async (projectId, options) => {
+      let inFlightRemoval: ReadonlySet<string> | undefined
       try {
         // Why: pass an explicit hostId so a duplicate id across hosts resolves to the intended row, not the focused-host fallback.
         const ownerRepo = findRepoForHost(get().repos, projectId, {
@@ -100,7 +112,7 @@ export function createRepoRemovalActions(
                   .flatMap((worktree) => (worktree.projectId ? [worktree.projectId] : []))
               ]
             : []
-        // Why: read tabs/PTYs before and after the await: that refetch purges them, and a PTY can attach meanwhile.
+        // Why: read tabs/PTYs before and after the await: another purge can drop them, and a PTY can attach meanwhile.
         const readTabPtyIds = (): { tabId: string; ptyIds: string[] }[] =>
           worktreeIds.flatMap((wId) =>
             (get().tabsByWorktree[wId] ?? []).map((tab) => ({
@@ -109,6 +121,13 @@ export function createRepoRemovalActions(
             }))
           )
         const tabPtyIdsBeforeRemoval = readTabPtyIds()
+        inFlightRemoval = new Set(worktreeIds)
+        let removals = worktreeIdsBeingRemoved.get(get)
+        if (!removals) {
+          removals = new Set()
+          worktreeIdsBeingRemoved.set(get, removals)
+        }
+        removals.add(inFlightRemoval)
         // Why: derive the target from the owner's settings (via options.hostId) so an SSH host removal never routes repo.rm to the focused runtime.
         const target = getActiveRuntimeTarget(
           settingsForRepoOwner(get(), projectId, options?.hostId)
@@ -278,6 +297,11 @@ export function createRepoRemovalActions(
           }
         })
       } catch (err) {
+        if (inFlightRemoval) {
+          // Why: a refetch during this removal may have dropped these rows and left their terminal state to us.
+          const listedIds = new Set(getKnownRepoWorktreeIds(get(), projectId))
+          get().purgeWorktreeTerminalState([...inFlightRemoval].filter((id) => !listedIds.has(id)))
+        }
         console.error('Failed to remove repo:', err)
         // Why: bulk and background callers aggregate their own failures, so only opted-in single-project entry points toast (#11994).
         if (options?.errorFeedback === 'toast') {
@@ -288,6 +312,10 @@ export function createRepoRemovalActions(
               duration: ERROR_TOAST_DURATION
             }
           )
+        }
+      } finally {
+        if (inFlightRemoval) {
+          worktreeIdsBeingRemoved.get(get)?.delete(inFlightRemoval)
         }
       }
     }

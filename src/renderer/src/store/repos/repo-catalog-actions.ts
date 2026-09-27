@@ -37,6 +37,7 @@ import {
   projectCompatibilityFromRepos
 } from '../projects/project-compatibility-core'
 import { getRuntimeTargetHostId } from '../runtime-target-host'
+import { withoutWorktreesBeingRemoved } from './repo-removal'
 import { mergeFetchedProjectCompatibilityForHost } from '../projects/project-compatibility-host-merge'
 import { scheduleSafeAutoForkSync } from './safe-auto-fork-sync'
 
@@ -170,7 +171,7 @@ export function createRepoCatalogActions(
         })
         if (droppedWorktreeIds.length > 0) {
           // Why: same cleanup as a worktree removed outside the window (worktree-event-runtime); nothing else purges these.
-          get().purgeWorktreeTerminalState(droppedWorktreeIds)
+          get().purgeWorktreeTerminalState(withoutWorktreesBeingRemoved(get, droppedWorktreeIds))
           get().removeWorkspaceSpaceWorktrees(droppedWorktreeIds)
         }
         scheduleSafeAutoForkSync(get, finalizedHostRepos)
